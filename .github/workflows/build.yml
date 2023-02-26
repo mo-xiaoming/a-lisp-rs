@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  #schedule:
+  #  - cron: '0 21 * * FRI'
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+# This allows a subsequently queued workflow run to interrupt previous runs
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.ref }}'
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ci:
+    name: ${{ matrix.os }}-${{ matrix.toolchain }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+        toolchain: [stable, beta]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+      - name: Install ${{ matrix.toolchain }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain }}
+          components: "clippy, rustfmt"
+      - name: Install cargo nextest
+        uses: taiki-e/install-action@nextest
+      - name: rust-clippy
+        run: |
+          cargo clippy --all-targets --no-deps -- -D warnings
+      - name: cargo-fmt
+        run: cargo fmt --all -- --check
+      - name: cargo test
+        run: |
+          cargo nextest run --release --all-targets --workspace
+          cargo test           --doc --workspace
+          cargo test --release --doc --workspace
+      - name: Generating documents
+        env:
+          RUSTDOCFLAGS: --cfg docsrs
+        run: cargo doc --no-deps
+      - name: Install cargo-llvm-cov
+        if: matrix.toolchain == 'stable'
+        uses: taiki-e/install-action@cargo-llvm-cov # needs rust 1.60+
+      - name: llvm-cov
+        if: matrix.toolchain == 'stable'
+        run: |
+          cargo llvm-cov --ignore-filename-regex='src/bin/.*\.rs' --fail-under-lines 80 --workspace
+      - name: llvm-conv for Rust ${{ matrix.toolchain }}
+        if: matrix.toolchain == 'stable'
+        run: |
+          cargo llvm-cov --ignore-filename-regex='src/bin/.*\.rs' --lcov --output-path lcov.info --workspace
+      - name: Upload coverage to Codecov for Rust ${{ matrix.toolchain }}
+        if: matrix.toolchain == 'stable'
+        uses: codecov/codecov-action@v3
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }} # not required for public repos
+          files: lcov.info
+          fail_ci_if_error: true
