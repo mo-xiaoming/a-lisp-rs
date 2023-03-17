@@ -1,102 +1,112 @@
 #![allow(unused)]
 
-#[derive(Debug, Clone, Eq)]
-pub struct Source {
+use std::{borrow::Cow, cell::Cell};
+
+use unicode_segmentation::UnicodeSegmentation;
+
+#[derive(Debug, Clone, std::hash::Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RawInput {
     content: String,
     path: std::path::PathBuf,
 }
 
-impl PartialEq for Source {
-    fn eq(&self, other: &Self) -> bool {
-        self.path == other.path
-    }
-}
-
-impl Source {
-    pub(crate) fn new<P: AsRef<std::path::Path>>(content: String, path: P) -> Self {
+impl RawInput {
+    #[cfg(test)]
+    pub(crate) fn new(content: String) -> Self {
         Self {
             content,
-            path: path.as_ref().to_owned(),
+            path: std::path::PathBuf::from("mock"),
+        }
+    }
+
+    pub(crate) fn unicode_input(&self) -> Input {
+        Input {
+            raw: self,
+            ucs: self.content.graphemes(true).collect(),
         }
     }
 }
 
-impl std::fmt::Display for Source {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "path: {}", self.path.display())
+#[derive(Debug, Clone, std::hash::Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Input<'i> {
+    raw: &'i RawInput,
+    ucs: Vec<&'i str>,
+}
+
+impl<'i> Input<'i> {
+    pub(crate) fn path(&self) -> Cow<str> {
+        self.raw.path.as_os_str().to_string_lossy()
     }
 }
 
 #[derive(Debug, Default, Clone, Copy, std::hash::Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Cursor(pub usize);
+pub struct Cursor(usize);
 
-impl Source {
-    pub fn is_empty(&self) -> bool {
-        self.content.is_empty()
+impl Cursor {
+    pub const fn from(n: usize) -> Self {
+        Self(n)
     }
-    pub fn len(&self) -> usize {
-        self.content.len()
+    pub const fn advance(&self, n: usize) -> Self {
+        Self(self.0 + n)
     }
-    pub fn take_while<P: Fn(char) -> bool>(&self, p: P) -> Option<&str> {
-        if (self.is_empty()) {
+
+    pub const fn get(&self) -> usize {
+        self.0
+    }
+}
+
+impl<'i> Input<'i> {
+    pub(crate) fn begin(&self) -> Cursor {
+        Cursor::from(0)
+    }
+
+    pub(crate) fn end(&self) -> Cursor {
+        Cursor::from(self.ucs.len())
+    }
+
+    pub(crate) fn get_str_ref(&self, begin: Cursor, end: Cursor) -> Option<&str> {
+        if begin >= end || end > self.end() {
+            None
+        } else {
+            Some(&self.raw.content[self.distance_from_begin(begin)..self.distance_from_begin(end)])
+        }
+    }
+
+    fn distance_from_begin(&self, cursor: Cursor) -> usize {
+        self.raw.content[cursor.get()..].as_ptr() as usize - self.raw.content.as_ptr() as usize
+    }
+
+    pub fn is_eof(&self, cursor: Cursor) -> bool {
+        cursor >= self.end()
+    }
+
+    pub fn rest_len(&self, cursor: Cursor) -> usize {
+        if self.is_eof(cursor) {
+            0
+        } else {
+            self.ucs.len() - cursor.get()
+        }
+    }
+
+    pub fn take_while<P>(&self, cursor: Cursor, p: P) -> Option<Cursor>
+    where
+        P: Fn(&str) -> bool,
+    {
+        if self.is_eof(cursor) {
             return None;
         }
 
-        match self.content.find(|c| !p(c)) {
+        match self.ucs[cursor.get()..].iter().position(|&s| !p(s)) {
             Some(0) => None,
-            Some(n) => Some(&self.content[..n]),
-            None => Some(&self.content),
+            Some(i) => Some(cursor.advance(i)),
+            None => Some(self.end()),
         }
     }
-    pub fn take_n(&self, n: usize) -> Option<&str> {
-        if self.content.len() < n || n == 0 {
-            None
-        } else {
-            Some(&self.content[..n])
-        }
-    }
-    pub fn char(&self) -> Option<char> {
-        self.content.chars().next()
-    }
-}
 
-fn is_eof(src: &Source, cursor: Cursor) -> bool {
-    src.is_empty() || src.len() <= cursor.0
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SourceRange<'src> {
-    pub(crate) src: &'src Source,
-    pub(crate) begin: usize,
-    pub(crate) end: usize,
-}
-
-impl<'src> std::fmt::Display for SourceRange<'src> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}-{}", self.src, self.begin, self.end - 1)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum Token<'src> {
-    Integer { v: u64, loc: SourceRange<'src> }, // signed 64-bit integer
-    Float { v: f64, loc: SourceRange<'src> },
-    String { v: String, loc: SourceRange<'src> },
-    Identifier { v: String, loc: SourceRange<'src> },
-    LParen { loc: SourceRange<'src> },
-    RParen { loc: SourceRange<'src> },
-}
-
-impl<'src> std::fmt::Display for Token<'src> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Token::Integer { v, loc } => write!(f, "{}: `{}::Integer`", loc, v),
-            Token::Float { v, loc } => write!(f, "{}: `{}::Float`", loc, v),
-            Token::String { v, loc } => write!(f, "{}: `{}::String`", loc, v),
-            Token::Identifier { v, loc } => write!(f, "{}: `{}::Identifier`", loc, v),
-            Token::LParen { loc } => write!(f, "{}: `LParen`", loc),
-            Token::RParen { loc } => write!(f, "{}: `RParen`", loc),
-        }
+    pub fn take_n(&self, cursor: Cursor, n: usize) -> Option<(Cursor, &str)> {
+        let new_cursor = cursor.advance(n);
+        self.get_str_ref(cursor, new_cursor)
+            .map(|s| (new_cursor, s))
     }
 }
 
@@ -105,81 +115,78 @@ mod test {
     use super::*;
 
     #[test]
-    fn fmt_token() {
-        let src = Source::new(String::new(), "hi");
-        let loc = SourceRange {
-            src: &src,
-            begin: 0,
-            end: 3,
-        };
-        assert_eq!(
-            format!("{}", Token::Integer { v: 42, loc }),
-            format!("{}: `42::Integer`", loc)
-        );
-        assert_eq!(
-            format!("{}", Token::Float { v: 42.42, loc }),
-            format!("{}: `42.42::Float`", loc)
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                Token::String {
-                    v: "hello world".to_owned(),
-                    loc
-                }
-            ),
-            format!("{}: `hello world::String`", loc)
-        );
-        assert_eq!(
-            format!(
-                "{}",
-                Token::Identifier {
-                    v: "foo".to_owned(),
-                    loc
-                }
-            ),
-            format!("{}: `foo::Identifier`", loc)
-        );
-        assert_eq!(
-            format!("{}", Token::LParen { loc }),
-            format!("{}: `LParen`", loc)
-        );
-        assert_eq!(
-            format!("{}", Token::RParen { loc }),
-            format!("{}: `RParen`", loc)
-        );
+    fn test_empty_input() {
+        // empty source
+        let empty = RawInput::new(String::new());
+        let empty = empty.unicode_input();
+
+        // 0th cursor
+        let cursor = empty.begin();
+        assert_eq!(cursor, empty.end());
+
+        assert!(empty.is_eof(cursor));
+        assert_eq!(empty.rest_len(cursor), 0);
+        assert_eq!(empty.take_while(cursor, |c| c == " "), None);
+        assert_eq!(empty.take_while(cursor, |c| c.is_empty()), None);
+        assert_eq!(empty.take_n(cursor, 0), None);
+        assert_eq!(empty.take_n(cursor, 1), None);
+
+        // out of range cursor
+        let cursor = cursor.advance(1);
+        assert!(empty.is_eof(cursor));
+        assert_eq!(empty.rest_len(cursor), 0);
+        assert_eq!(empty.take_while(cursor, |c| c == " "), None);
+        assert_eq!(empty.take_while(cursor, |c| c.is_empty()), None);
+        assert_eq!(empty.take_n(cursor, 0), None);
+        assert_eq!(empty.take_n(cursor, 1), None);
     }
 
     #[test]
-    fn test_source() {
-        let source = Source::new(String::new(), "hi");
+    fn test_non_empty_input() {
+        // non-empty source
+        let source = RawInput::new("aabc".to_owned());
+        let source = source.unicode_input();
 
-        assert!(source.is_empty());
-        assert!(is_eof(&source, Cursor(0)));
-        assert_eq!(source.len(), 0);
-        assert_eq!(source.take_while(|c| c == ' '), None);
-        assert_eq!(source.take_n(0), None);
-        assert_eq!(source.take_n(1), None);
-        assert_eq!(source.char(), None);
+        // 0th cursor
+        let cursor = source.begin();
+        assert_ne!(cursor, source.end());
 
-        let content = "aabc";
-        let source = Source::new(content.to_owned(), "hi");
+        assert!(!source.is_eof(cursor));
+        assert_eq!(source.rest_len(cursor), 4);
+        assert_eq!(
+            source.get_str_ref(cursor, source.take_while(cursor, |c| c == "a").unwrap()),
+            Some("aa")
+        );
+        assert_eq!(source.take_while(cursor, |c| c == "b"), None);
+        assert_eq!(source.take_n(cursor, 0), None);
+        assert_eq!(source.take_n(cursor, 1), Some((cursor.advance(1), "a")));
+        assert_eq!(source.take_n(cursor, 4), Some((cursor.advance(4), "aabc")));
+        assert_eq!(source.take_n(cursor, 5), None);
 
-        assert!(!source.is_empty());
-        for i in 0..6 {
-            if i < source.len() {
-                assert!(!is_eof(&source, Cursor(i)));
-            } else {
-                assert!(is_eof(&source, Cursor(i)));
-            }
-        }
-        assert_eq!(source.len(), 4);
-        assert_eq!(source.take_while(|c| c == 'a'), Some("aa"));
-        assert_eq!(source.take_while(|c| c == 'b'), None);
-        assert_eq!(source.take_n(0), None);
-        assert_eq!(source.take_n(1), Some("a"));
-        assert_eq!(source.take_n(source.len()), Some(content));
-        assert_eq!(source.take_n(source.len() + 1), None);
-        assert_eq!(source.char(), Some('a'));
+        // 1th cursor
+        let cursor = source.begin().advance(1);
+        assert!(!source.is_eof(cursor));
+        assert_eq!(source.rest_len(cursor), 3);
+        assert_eq!(
+            source.take_while(cursor, |c| c == "a"),
+            Some(Cursor::from(2))
+        );
+        assert_eq!(source.take_while(cursor, |c| c == "b"), None);
+        assert_eq!(source.take_n(cursor, 0), None);
+        assert_eq!(source.take_n(cursor, 1), Some((cursor.advance(1), "a")));
+        assert_eq!(source.take_n(cursor, 3), Some((cursor.advance(3), "abc")));
+        assert_eq!(source.take_n(cursor, 4), None);
+
+        let full_len = source.rest_len(source.begin());
+        assert_eq!(full_len, 4);
+
+        // end cursor
+        let cursor = source.end();
+        assert!(source.is_eof(cursor));
+        assert_eq!(source.rest_len(cursor), 0);
+        assert_eq!(source.take_while(cursor, |c| c == "a"), None);
+        assert_eq!(source.take_while(cursor, |c| c == "b"), None);
+        assert_eq!(source.take_n(cursor, 0), None);
+        assert_eq!(source.take_n(cursor, 1), None);
     }
 }

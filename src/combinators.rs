@@ -1,380 +1,476 @@
 #![allow(unused)]
 
-use crate::lexer::Cursor;
+use crate::lexer::{Cursor, Input};
 
-use crate::lexer::{Source, SourceRange, Token};
-
-pub(crate) trait ParseError<'src> {
-    fn description(&'src self, src: &'src Source) -> String;
+fn is_ascii_digit(c: &str) -> bool {
+    assert_eq!(c.len(), 1);
+    const ASCII_DIGITS: &str = "0123456789";
+    ASCII_DIGITS.contains(c)
 }
 
-type IResult<'src, O, E> = Result<(Cursor, O), E>;
+fn is_ascii_alpha(c: &str) -> bool {
+    assert_eq!(c.len(), 1);
+    const ASCII_ALPHABETS: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    ASCII_ALPHABETS.contains(c)
+}
+
+fn is_ascii_alphanumeric(c: &str) -> bool {
+    assert_eq!(c.len(), 1);
+    is_ascii_alpha(c) || is_ascii_digit(c)
+}
+
+pub trait ParseError: std::fmt::Display {}
 
 #[derive(Debug, Clone)]
-struct EarlyEof<'src> {
-    src: &'src Source,
+struct EarlyEof<'i> {
+    input: &'i Input<'i>,
     expected: String,
 }
 
-impl<'src> ParseError<'src> for EarlyEof<'src> {
-    fn description(&'src self, src: &'src Source) -> String {
-        todo!()
+impl<'i> ParseError for EarlyEof<'i> {}
+
+impl<'i> std::fmt::Display for EarlyEof<'i> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: expected `{}`, but reached EOF",
+            self.input.path(),
+            self.expected
+        )
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct ParseCharError<'src> {
+pub struct ParseCharError<'i> {
+    input: &'i Input<'i>,
     expected: String,
-    got: SourceRange<'src>,
+    got: Cursor,
 }
 
-impl<'src> ParseError<'src> for ParseCharError<'src> {
-    fn description(&'src self, src: &'src Source) -> String {
-        todo!()
+impl<'i> ParseError for ParseCharError<'i> {}
+
+impl<'i> std::fmt::Display for ParseCharError<'i> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: expected `{}`, but got `{}`",
+            self.input.path(),
+            self.expected,
+            self.input
+                .get_str_ref(self.got, self.got.advance(1))
+                .unwrap()
+        )
     }
 }
 
-fn char(c: char) -> impl Fn(&Source, Cursor) -> IResult<'_, (char, SourceRange), ParseCharError> {
-    move |src: &Source, mut cursor: Cursor| {
-        assert!(!src.is_empty(), "char parser doesn't support empty source");
-        assert!(
-            !src.is_empty() && src.len() > cursor.0,
-            "char parser reaches EOF before parsing"
-        );
+fn char<'i>(
+    input: &'i Input<'i>,
+    cursor: Cursor,
+    c: &str,
+) -> Result<(Cursor, &'i str), ParseCharError<'i>> {
+    assert!(!input.is_eof(cursor), "char parser reaches EOF");
 
-        let x = src.char().unwrap();
+    let (new_cursor, x) = input.take_n(cursor, 1).unwrap();
+    assert_eq!(new_cursor, cursor.advance(1));
 
-        if x == c {
-            cursor.0 += 1;
-            Ok((
-                cursor,
-                (
-                    x,
-                    SourceRange {
-                        src,
-                        begin: cursor.0 - 1,
-                        end: cursor.0,
-                    },
-                ),
-            ))
-        } else {
-            Err(ParseCharError {
-                expected: c.to_string(),
-                got: SourceRange {
-                    src,
-                    begin: cursor.0,
-                    end: cursor.0 + 1,
-                },
-            })
-        }
+    if x == c {
+        Ok((new_cursor, x))
+    } else {
+        Err(ParseCharError {
+            input,
+            expected: c.to_owned(),
+            got: cursor,
+        })
     }
 }
 
-pub fn lparen() -> impl Fn(&Source, Cursor) -> IResult<'_, Token, ParseCharError> {
-    move |src: &Source, mut cursor: Cursor| {
-        char('(')(src, cursor).map(|(i, (_, loc))| (i, Token::LParen { loc }))
-    }
+pub fn lparen<'i>(
+    input: &'i Input<'i>,
+    cursor: Cursor,
+) -> Result<(Cursor, ()), ParseCharError<'i>> {
+    char(input, cursor, "(").map(|(i, _)| (i, ()))
 }
 
-pub fn rparen() -> impl Fn(&Source, Cursor) -> IResult<'_, Token, ParseCharError> {
-    move |src: &Source, mut cursor: Cursor| {
-        char(')')(src, cursor).map(|(i, (_, loc))| (i, Token::RParen { loc }))
-    }
+pub fn rparen<'i>(
+    input: &'i Input<'i>,
+    cursor: Cursor,
+) -> Result<(Cursor, ()), ParseCharError<'i>> {
+    char(input, cursor, ")").map(|(i, _)| (i, ()))
 }
 
 #[derive(Debug, Clone)]
-pub enum ParseIntegerError<'src> {
-    Unexpected { got: SourceRange<'src> },
-    Overflow { got: SourceRange<'src> },
-    LeadingZero { got: SourceRange<'src> },
+pub enum ParseIntegerError<'i> {
+    Unexpected {
+        input: &'i Input<'i>,
+        got: Cursor,
+    },
+    PosOverflow {
+        input: &'i Input<'i>,
+        got: (Cursor, Cursor),
+    },
+    NegOverflow {
+        input: &'i Input<'i>,
+        got: (Cursor, Cursor),
+    },
+    UnexpectedEof {
+        input: &'i Input<'i>,
+        got: Cursor,
+    },
+    LeadingZero,
 }
 
-pub fn integer() -> impl Fn(&Source, Cursor) -> IResult<'_, Token, ParseIntegerError> {
-    move |src: &Source, mut cursor: Cursor| {
-        assert!(
-            !src.is_empty(),
-            "integer parser doesn't support empty source"
-        );
+pub fn integer<'i>(
+    input: &'i Input<'i>,
+    cursor: Cursor,
+) -> Result<(Cursor, i64), ParseIntegerError> {
+    assert!(!input.is_eof(cursor), "integer parser reaches EOF");
 
-        if src.char() == Some('0') {
-            return Err(ParseIntegerError::LeadingZero {
-                got: SourceRange {
-                    src,
-                    begin: cursor.0,
-                    end: cursor.0 + 1,
-                },
-            });
-        }
+    let (has_sign, neg) = match input.take_n(cursor, 1).unwrap().1 {
+        "+" => (true, false),
+        "-" => (true, true),
+        c if "0123456789".contains(c) => (false, false),
+        _ => return Err(ParseIntegerError::Unexpected { input, got: cursor }),
+    };
 
-        let s = src.take_while(|c| c.is_ascii_digit()).ok_or({
-            ParseIntegerError::Unexpected {
-                got: SourceRange {
-                    src,
-                    begin: cursor.0,
-                    end: cursor.0 + 1,
-                },
-            }
-        })?;
-
-        let i = s.parse::<u64>().map_err(|e| match e.kind() {
-            std::num::IntErrorKind::PosOverflow => ParseIntegerError::Overflow {
-                got: SourceRange {
-                    src,
-                    begin: cursor.0,
-                    end: cursor.0 + s.len(),
-                },
-            },
-            _ => unreachable!("unexpected {{integer}} parsing error"),
-        })?;
-
-        Ok((
-            Cursor(cursor.0 + s.len()),
-            Token::Integer {
-                v: i,
-                loc: SourceRange {
-                    src,
-                    begin: cursor.0,
-                    end: cursor.0 + s.len(),
-                },
-            },
-        ))
+    let digit_begin = if has_sign { cursor.advance(1) } else { cursor };
+    if input.is_eof(digit_begin) {
+        return Err(ParseIntegerError::UnexpectedEof {
+            input,
+            got: digit_begin,
+        });
     }
+
+    let digit_end =
+        input
+            .take_while(digit_begin, is_ascii_digit)
+            .ok_or(ParseIntegerError::Unexpected {
+                input,
+                got: digit_begin,
+            })?;
+
+    let digits = input.get_str_ref(cursor, digit_end).unwrap();
+
+    if digits.len() != 1 && digits.starts_with('0') {
+        return Err(ParseIntegerError::LeadingZero);
+    }
+
+    let i = digits.parse::<i64>().map_err(|e| match e.kind() {
+        std::num::IntErrorKind::PosOverflow => ParseIntegerError::PosOverflow {
+            input,
+            got: (cursor, digit_end),
+        },
+        std::num::IntErrorKind::NegOverflow => ParseIntegerError::NegOverflow {
+            input,
+            got: (cursor, digit_end),
+        },
+        _ => unreachable!("unexpected {{integer}} parsing error"),
+    })?;
+
+    Ok((digit_end, i))
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct ParseIdentifierError<'src> {
-    got: SourceRange<'src>,
+pub struct ParseIdentifierError<'i> {
+    input: &'i Input<'i>,
+    got: Cursor,
 }
 
-pub fn identifier() -> impl Fn(&Source, Cursor) -> IResult<'_, Token, ParseIdentifierError> {
-    move |src: &Source, mut cursor: Cursor| {
-        assert!(
-            !src.is_empty(),
-            "identifier parser doesn't support empty source"
-        );
+pub fn identifier<'i>(
+    input: &'i Input<'i>,
+    cursor: Cursor,
+) -> Result<(Cursor, &'i str), ParseIdentifierError> {
+    assert!(!input.is_eof(cursor), "identifier parser reaches EOF");
 
-        let ef = || ParseIdentifierError {
-            got: SourceRange {
-                src,
-                begin: cursor.0,
-                end: cursor.0 + 1,
-            },
-        };
+    let new_cursor = input
+        .take_while(cursor, |c| is_ascii_alphanumeric(c) || c == "_")
+        .filter(|_| !is_ascii_digit(input.get_str_ref(cursor, cursor.advance(1)).unwrap()))
+        .ok_or(ParseIdentifierError { input, got: cursor })?;
 
-        let s = src
-            .take_while(|c| c.is_ascii_alphanumeric() || c == '_')
-            .ok_or_else(ef)?;
-        s.chars()
-            .next()
-            .filter(|c| !c.is_ascii_digit())
-            .ok_or_else(ef)?;
-
-        Ok((
-            Cursor(cursor.0 + s.len()),
-            Token::Identifier {
-                v: s.to_owned(),
-                loc: SourceRange {
-                    src,
-                    begin: cursor.0,
-                    end: cursor.0 + s.len(),
-                },
-            },
-        ))
-    }
+    Ok((new_cursor, input.get_str_ref(cursor, new_cursor).unwrap()))
 }
 
 #[cfg(test)]
 mod test {
+    use crate::lexer::RawInput;
+
     use super::*;
 
-    #[test]
-    #[should_panic(expected = "char parser doesn't support empty source")]
-    fn lparen_panic_on_empty_source1() {
-        let source = Source::new(String::new(), "hi");
-        let _r = lparen()(&source, Cursor::default());
+    fn empty_raw_input() -> RawInput {
+        RawInput::new(String::new())
+    }
+
+    fn non_empty_raw_input() -> RawInput {
+        RawInput::new("hi".to_owned())
     }
 
     #[test]
-    #[should_panic(expected = "char parser reaches EOF before parsing")]
-    fn lparen_panic_on_empty_source2() {
-        let content = "hi".to_owned();
-        let source = Source::new(content, "hi");
-        let _r = lparen()(&source, Cursor(source.len()));
+    #[should_panic(expected = "char parser reaches EOF")]
+    fn lparen_panic_on_empty_input() {
+        let input = empty_raw_input();
+        let input = input.unicode_input();
+        let _r = lparen(&input, input.begin());
     }
 
     #[test]
-    #[should_panic(expected = "char parser doesn't support empty source")]
-    fn rparen_panic_on_empty_source_1() {
-        let source = Source::new(String::new(), "hi");
-        let _r = rparen()(&source, Cursor::default());
+    #[should_panic(expected = "char parser reaches EOF")]
+    fn lparen_panic_on_eof() {
+        let input = non_empty_raw_input();
+        let input = input.unicode_input();
+        let _r = lparen(&input, input.end());
     }
 
     #[test]
-    #[should_panic(expected = "char parser reaches EOF before parsing")]
-    fn rparen_panic_on_empty_source2() {
-        let content = "hi".to_owned();
-        let source = Source::new(content, "hi");
-        let _r = rparen()(&source, Cursor(source.len()));
+    #[should_panic(expected = "char parser reaches EOF")]
+    fn rparen_panic_on_empty_input() {
+        let input = empty_raw_input();
+        let input = input.unicode_input();
+        let _r = rparen(&input, input.begin());
     }
 
-    fn test_paren_ok<P, T>(parser: &P, c: char, content: &str, t: &T)
+    #[test]
+    #[should_panic(expected = "char parser reaches EOF")]
+    fn rparen_panic_on_eof() {
+        let input = non_empty_raw_input();
+        let input = input.unicode_input();
+        let _r = rparen(&input, input.end());
+    }
+
+    fn test_paren_ok<P>(parser: P, input: &RawInput, cursor: Cursor)
     where
-        P: Fn(&Source, Cursor) -> IResult<'_, Token, ParseCharError>,
-        T: for<'src> Fn(&'src Source) -> Token<'src>,
+        P: for<'i> Fn(&'i Input<'i>, Cursor) -> Result<(Cursor, ()), ParseCharError<'i>>,
     {
-        let source = Source::new(content.to_owned(), "hi");
-        let r = parser(&source, Cursor::default());
+        let _input = input.unicode_input();
+        let r = parser(&_input, cursor);
         assert!(matches!(
             r,
             Ok((
-                Cursor(1),
-                token,
-            )) if token == t(&source)
-        ));
+                new_cursor, ()
+            )) if new_cursor == cursor.advance(1)
+        ),);
     }
 
-    fn test_paren_err<P>(parser: &P, c: char)
+    fn test_paren_err<P>(parser: P, c: &str, input: &RawInput, cursor: Cursor)
     where
-        P: Fn(&Source, Cursor) -> IResult<'_, Token, ParseCharError>,
+        P: for<'i> Fn(&'i Input<'i>, Cursor) -> Result<(Cursor, ()), ParseCharError<'i>>,
     {
-        let source = Source::new("x".to_owned(), "hi");
-        let r = parser(&source, Cursor::default());
+        let input = input.unicode_input();
+        let r = parser(&input, cursor);
         assert!(
-            matches!(r, Err(ParseCharError{ expected, got: SourceRange {  begin: 0, end: 1,.. } }) if expected == c.to_string() )
+            matches!(r, Err(ParseCharError{ input, expected, got  }) if expected == c && got ==  cursor)
         );
     }
 
     #[test]
     fn test_parens() {
-        let p = lparen();
-        fn lp(src: &Source) -> Token {
-            Token::LParen {
-                loc: SourceRange {
-                    src,
-                    begin: 0,
-                    end: 1,
-                },
-            }
-        };
+        let input = RawInput::new("(".to_owned());
+        test_paren_ok(lparen, &input, Cursor::from(0));
+        let input = RawInput::new("x(".to_owned());
+        test_paren_ok(lparen, &input, Cursor::from(1));
+        let input = RawInput::new("(xx".to_owned());
+        test_paren_ok(lparen, &input, Cursor::from(0));
+        let input = RawInput::new("(xx".to_owned());
+        test_paren_err(lparen, "(", &input, Cursor::from(1));
 
-        test_paren_ok(&p, '(', "(", &lp);
-        test_paren_ok(&p, '(', "(xx", &lp);
-        test_paren_err(&p, '(');
-
-        let p = rparen();
-        fn rp(src: &Source) -> Token {
-            Token::RParen {
-                loc: SourceRange {
-                    src,
-                    begin: 0,
-                    end: 1,
-                },
-            }
-        };
-
-        test_paren_ok(&p, ')', ")", &rp);
-        test_paren_ok(&p, ')', ")xx", &rp);
-        test_paren_err(&p, ')');
+        let input = RawInput::new(")".to_owned());
+        test_paren_ok(rparen, &input, Cursor::from(0));
+        let input = RawInput::new("x)".to_owned());
+        test_paren_ok(rparen, &input, Cursor::from(1));
+        let input = RawInput::new(")xx".to_owned());
+        test_paren_ok(rparen, &input, Cursor::from(0));
+        let input = RawInput::new(")xx".to_owned());
+        test_paren_err(rparen, ")", &input, Cursor::from(1));
     }
 
     #[test]
-    #[should_panic(expected = "integer parser doesn't support empty source")]
-    fn integer_panics_on_empty_source() {
-        let source = Source::new(String::new(), "hi");
-        let _r = integer()(&source, Cursor::default());
+    #[should_panic(expected = "integer parser reaches EOF")]
+    fn integer_panics_on_empty_input() {
+        let input = empty_raw_input();
+        let input = input.unicode_input();
+        let _r = integer(&input, input.begin());
     }
 
     #[test]
-    fn test_integer() {
-        let sf = |(s, len): (&str, usize)| {
-            let source = Source::new(s.to_owned(), "hi");
-            let r = integer()(&source, Cursor::default());
+    #[should_panic(expected = "integer parser reaches EOF")]
+    fn integer_panics_on_eof() {
+        let input = non_empty_raw_input();
+        let input = input.unicode_input();
+        let _r = integer(&input, input.end());
+    }
+
+    #[test]
+    fn test_normal_integers() {
+        let sf = |(s, expected, advance, cursor): (&str, i64, usize, Cursor)| {
+            let input = RawInput::new(s.to_owned());
+            let input = input.unicode_input();
+            let r = integer(&input, cursor);
             assert!(matches!(
                 r,
                 Ok((
-                    Cursor(off),
-                    Token::Integer {
-                        v: 12345,
-                        loc: SourceRange {
-                            begin: 0,
-                            end,
-                            ..
-                        }
-                    }
-                )) if off == 5 && end == 5
+                        c,
+                        v,
+                )) if c == cursor.advance(advance) && v == expected
             ));
         };
 
-        for s in [("12345", 5), ("12345abc", 5)] {
+        for s in [
+            ("0", 0, 1, Cursor::from(0)),
+            ("+0", 0, 2, Cursor::from(0)),
+            ("-0", 0, 2, Cursor::from(0)),
+            ("12345", 12345, 5, Cursor::from(0)),
+            ("12345abc", 12345, 5, Cursor::from(0)),
+            ("+12345", 12345, 6, Cursor::from(0)),
+            ("+12345abc", 12345, 6, Cursor::from(0)),
+            ("-12345", -12345, 6, Cursor::from(0)),
+            ("-12345abc", -12345, 6, Cursor::from(0)),
+            ("12345", 345, 3, Cursor::from(2)),
+            ("12345abc", 345, 3, Cursor::from(2)),
+            ("12+345", 345, 4, Cursor::from(2)),
+            ("12+345abc", 345, 4, Cursor::from(2)),
+            ("12-345", -345, 4, Cursor::from(2)),
+            ("12-345abc", -345, 4, Cursor::from(2)),
+            ("120", 0, 1, Cursor::from(2)),
+            ("12+0", 0, 2, Cursor::from(2)),
+            ("12-0", 0, 2, Cursor::from(2)),
+            (
+                "9223372036854775807", // MAX
+                i64::MAX,
+                i64::MAX.to_string().len(),
+                Cursor::from(0),
+            ),
+            (
+                "+9223372036854775807", // MAX
+                i64::MAX,
+                i64::MAX.to_string().len() + 1,
+                Cursor::from(0),
+            ),
+            (
+                "-9223372036854775808", // MIN
+                i64::MIN,
+                i64::MIN.to_string().len(),
+                Cursor::from(0),
+            ),
+        ] {
             sf(s);
         }
+    }
 
-        let source = Source::new("012345".to_owned(), "hi");
-        let r = integer()(&source, Cursor::default());
-        assert!(matches!(
-            r,
-            Err(ParseIntegerError::LeadingZero {
-                got: SourceRange {
-                    begin: 0,
-                    end: 1,
+    #[test]
+    fn integer_starts_with_zero_is_not_allowed() {
+        let input = RawInput::new("012345".to_owned());
+        let input = input.unicode_input();
+        let r = integer(&input, input.begin());
+        assert!(matches!(r, Err(ParseIntegerError::LeadingZero)));
+    }
+
+    #[test]
+    fn integer_has_no_digits_after_sign_is_not_allowed() {
+        for s in ["+", "-"] {
+            let input = RawInput::new(s.to_owned());
+            let input = input.unicode_input();
+            let r = integer(&input, input.begin());
+            assert!(matches!(
+                r,
+                Err(ParseIntegerError::UnexpectedEof {
+                    got,
                     ..
-                }
-            })
-        ));
+                }) if got == input.begin().advance(1)
+            ));
+        }
+    }
 
-        let source = Source::new("abc".to_owned(), "hi");
-        let r = integer()(&source, Cursor::default());
+    #[test]
+    fn integer_has_no_digits_is_not_allowed() {
+        let input = RawInput::new("abc".to_owned());
+        let input = input.unicode_input();
+        let r = integer(&input, input.begin());
         assert!(matches!(
             r,
             Err(ParseIntegerError::Unexpected {
-                got: SourceRange {
-                    begin: 0,
-                    end: 1,
-                    ..
-                }
-            })
-        ));
+                got,
+                ..
+            }) if got == input.begin()));
+    }
 
-        let ov = "18446744073709551616".to_owned(); // u64::max + 1
-        let source = Source::new(ov.clone(), "hi");
-        let r = integer()(&source, Cursor::default());
+    #[test]
+    fn integer_overflows() {
+        let input = RawInput::new("9223372036854775808".to_owned()); // MAX + 1
+        let input = input.unicode_input();
+        let r = integer(&input, input.begin());
         assert!(matches!(
             r,
-            Err(ParseIntegerError::Overflow {
-                got: SourceRange {
-                    begin: 0,
-                    end,
-                    ..
-                }
-            }) if end == ov.len()
+            Err(ParseIntegerError::PosOverflow {
+                got, ..
+            }) if got == (input.begin(), input.end())
         ));
     }
 
     #[test]
-    #[should_panic(expected = "identifier parser doesn't support empty source")]
-    fn identifier_panics_on_empty_source() {
-        let source = Source::new(String::new(), "hi");
-        let _r = identifier()(&source, Cursor::default());
+    fn integer_overflows_consume_all_digits() {
+        let input = RawInput::new("92233720368547758081".to_owned()); // MAX + N
+        let input = input.unicode_input();
+        let r = integer(&input, input.begin());
+        assert!(matches!(
+            r,
+            Err(ParseIntegerError::PosOverflow {
+                got, ..
+            }) if got == (input.begin(), input.end())
+        ));
+    }
+
+    #[test]
+    fn integer_underflow() {
+        let input = RawInput::new("-9223372036854775809".to_owned()); // MIN - 1
+        let input = input.unicode_input();
+        let r = integer(&input, input.begin());
+        assert!(matches!(
+            r,
+            Err(ParseIntegerError::NegOverflow {
+                got, ..
+            }) if got == (input.begin(), input.end())
+        ));
+    }
+
+    #[test]
+    fn integer_underflow_consume_all_digits() {
+        let input = RawInput::new("-92233720368547758091".to_owned()); // MIN - N
+        let input = input.unicode_input();
+        let r = integer(&input, input.begin());
+        assert!(matches!(
+            r,
+            Err(ParseIntegerError::NegOverflow {
+                got, ..
+            }) if got == (input.begin(), input.end())
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "identifier parser reaches EOF")]
+    fn identifier_panics_on_empty_input() {
+        let input = empty_raw_input();
+        let input = input.unicode_input();
+        let _r = identifier(&input, input.begin());
+    }
+
+    #[test]
+    #[should_panic(expected = "identifier parser reaches EOF")]
+    fn identifier_panics_on_eof() {
+        let input = non_empty_raw_input();
+        let input = input.unicode_input();
+        let _r = identifier(&input, input.end());
     }
 
     #[test]
     fn test_identifier() {
         let sf = |s: &str| {
-            let source = Source::new(s.to_owned(), "hi");
-            let r = identifier()(&source, Cursor::default());
+            let input = RawInput::new(s.to_owned());
+            let input = input.unicode_input();
+            let r = identifier(&input, input.begin());
             assert!(matches!(
                 r,
                 Ok((
-                    Cursor(off),
-                    Token::Identifier {
-                        v,
-                        loc: SourceRange {
-                            begin: 0,
-                            end,
-                            ..
-                        }
-                    }
-                )) if off == s.len() && end == s.len() && v == s
+                    c,
+                    v
+                )) if c == input.begin().advance(s.len()) && v == s
             ));
         };
 
@@ -383,17 +479,14 @@ mod test {
         }
 
         let ef = |s: &str| {
-            let source = Source::new(s.to_owned(), "hi");
-            let r = identifier()(&source, Cursor::default());
+            let input = RawInput::new(s.to_owned());
+            let input = input.unicode_input();
+            let r = identifier(&input, input.begin());
             assert!(matches!(
                 r,
                 Err(ParseIdentifierError {
-                    got: SourceRange {
-                        begin: 0,
-                        end: 1,
-                        ..
-                    }
-                })
+                    got,..
+                }) if got == input.begin()
             ));
         };
 

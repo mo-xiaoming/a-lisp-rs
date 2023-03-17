@@ -8,5 +8,6 @@ edition = "2021"
 [features]
 
 [dependencies]
+unicode-segmentation = "1.10"
 
 [dev-dependencies]
