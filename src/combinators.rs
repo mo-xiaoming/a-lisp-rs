@@ -189,6 +189,74 @@ pub fn identifier<'i>(
     Ok((new_cursor, input.get_str_ref(cursor, new_cursor).unwrap()))
 }
 
+#[derive(Debug, Clone, Copy)]
+pub enum ParseSymbolError<'i> {
+    NoLeadingHash {
+        input: &'i Input<'i>,
+        got: Cursor,
+    },
+    UnexpectedEof {
+        input: &'i Input<'i>,
+        got: Cursor,
+    },
+    Unknown {
+        input: &'i Input<'i>,
+        got: (Cursor, Cursor),
+    },
+}
+
+#[derive(Debug, Clone, Copy, std::hash::Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Symbol {
+    True,
+    False,
+}
+
+impl std::fmt::Display for Symbol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl Symbol {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Symbol::True => "#t",
+            Symbol::False => "#f",
+        }
+    }
+}
+
+pub fn symbol<'i>(
+    input: &'i Input<'i>,
+    cursor: Cursor,
+) -> Result<(Cursor, Symbol), ParseSymbolError> {
+    assert!(!input.is_eof(cursor), "symbol parser reaches EOF");
+
+    if input.get_str_ref(cursor, cursor.advance(1)) != Some("#") {
+        return Err(ParseSymbolError::NoLeadingHash { input, got: cursor });
+    }
+
+    let after_hash_cursor = cursor.advance(1);
+    if input.is_eof(after_hash_cursor) {
+        return Err(ParseSymbolError::UnexpectedEof {
+            input,
+            got: after_hash_cursor,
+        });
+    }
+    let (end_cursor, s) =
+        identifier(input, after_hash_cursor).map_err(|ParseIdentifierError { input, got }| {
+            ParseSymbolError::UnexpectedEof { input, got }
+        })?;
+    match s {
+        "t" => Ok((end_cursor, Symbol::True)),
+        "f" => Ok((end_cursor, Symbol::False)),
+        _ => Err(ParseSymbolError::Unknown {
+            input,
+            got: (cursor, end_cursor),
+        }),
+    }
+}
+
 #[cfg(test)]
 mod test {
     use crate::lexer::RawInput;
@@ -493,5 +561,94 @@ mod test {
         for s in ["3ab", "3_ab", "#ab", "@ab"] {
             ef(s);
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "symbol parser reaches EOF")]
+    fn symbol_panics_on_empty_input() {
+        let input = empty_raw_input();
+        let input = input.unicode_input();
+        let _r = symbol(&input, input.begin());
+    }
+
+    #[test]
+    #[should_panic(expected = "symbol parser reaches EOF")]
+    fn symbol_panics_on_eof() {
+        let input = non_empty_raw_input();
+        let input = input.unicode_input();
+        let _r = symbol(&input, input.end());
+    }
+
+    #[test]
+    fn test_symbol() {
+        let sf = |s: &str, sym: Symbol| {
+            let input = RawInput::new(s.to_owned());
+            let input = input.unicode_input();
+            let r = symbol(&input, input.begin());
+            assert!(matches!(
+                r,
+                Ok((
+                    c,
+                    v
+                )) if c == input.begin().advance(sym.as_str().len()) && v == sym
+            ),);
+        };
+
+        for (s, m) in [
+            ("#t", Symbol::True),
+            ("#t(", Symbol::True),
+            ("#f", Symbol::False),
+            ("#f(", Symbol::False),
+        ] {
+            sf(s, m);
+        }
+    }
+
+    #[test]
+    fn test_symbol_hash_only() {
+        let sf = |s: &str| {
+            let input = RawInput::new(s.to_owned());
+            let input = input.unicode_input();
+            let r = symbol(&input, input.begin());
+            assert!(matches!(
+                r,
+                Err(ParseSymbolError::UnexpectedEof{
+                   got,
+                   ..
+                }) if got == input.begin().advance(1)
+            ),);
+        };
+
+        for s in ["#", "#3", "##"] {
+            sf(s);
+        }
+    }
+
+    #[test]
+    fn test_symbol_no_hash() {
+        let input = RawInput::new("a#".to_owned());
+        let input = input.unicode_input();
+        let r = symbol(&input, input.begin());
+        assert!(matches!(
+            r,
+            Err(ParseSymbolError::NoLeadingHash{
+               got,
+               ..
+            }) if got == input.begin()
+        ),);
+    }
+
+    #[test]
+    fn test_symbol_unknown() {
+        let input = RawInput::new("#xyz".to_owned());
+        let input = input.unicode_input();
+        let r = symbol(&input, input.begin());
+        assert!(matches!(
+            r,
+            Err(ParseSymbolError::Unknown{
+               got,
+               ..
+            }) if got == (input.begin(), input.begin().advance(4))
+        ),);
     }
 }
