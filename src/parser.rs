@@ -190,3 +190,61 @@ mod test {
         assert_eq!(source.take_n(cursor, 1), None);
     }
 }
+
+use crate::combinators::{lparen, ParseCharError};
+
+#[derive(Debug, Clone, Copy, std::hash::Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SourceLocation<'i> {
+    input: &'i Input<'i>,
+    range: (Cursor, Cursor),
+}
+
+#[derive(Debug, Default, Clone, Copy, std::hash::Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExprIndex(usize);
+
+impl ExprIndex {
+    pub const fn from(n: usize) -> Self {
+        Self(n)
+    }
+
+    pub const fn get(&self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, std::hash::Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Expr<'i> {
+    Unit {
+        idx: ExprIndex,
+        loc: SourceLocation<'i>,
+    },
+}
+
+fn parse<'i>(input: &'i Input<'i>) -> Result<Expr<'i>, ()> {
+    let exprs = Vec::<Expr>::with_capacity(3000);
+
+    let cursor = input.begin();
+    lparen(input, cursor).map_err(|e| ())?;
+
+    Ok(Expr::Unit {
+        idx: ExprIndex::from(0),
+        loc: SourceLocation {
+            input,
+            range: (Cursor::from(0), Cursor::from(1)),
+        },
+    })
+}
+
+#[cfg(test)]
+mod test_parse {
+    use super::*;
+
+    #[test]
+    fn file_level_empty_parens() {
+        let input = RawInput::new("()".to_owned());
+        let input = input.unicode_input();
+
+        let r = parse(&input);
+        assert!(matches!(r, Ok(Expr::Unit { .. })));
+    }
+}

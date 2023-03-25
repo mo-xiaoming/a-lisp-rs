@@ -4,7 +4,7 @@
 #![forbid(overflowing_literals)]
 
 mod combinators;
-mod lexer;
+mod parser;
 
 #[doc = include_str!("../README.md")]
 #[cfg(doctest)]

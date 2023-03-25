@@ -1,6 +1,6 @@
 #![allow(unused)]
 
-use crate::lexer::{Cursor, Input};
+use crate::parser::{Cursor, Input};
 
 fn is_ascii_digit(c: &str) -> bool {
     assert_eq!(c.len(), 1);
@@ -17,6 +17,10 @@ fn is_ascii_alpha(c: &str) -> bool {
 fn is_ascii_alphanumeric(c: &str) -> bool {
     assert_eq!(c.len(), 1);
     is_ascii_alpha(c) || is_ascii_digit(c)
+}
+
+fn is_ascii_whitespace(c: &str) -> bool {
+    c.len() == 1 && c.chars().next().unwrap().is_ascii_whitespace()
 }
 
 pub trait ParseError: std::fmt::Display {}
@@ -38,6 +42,12 @@ impl<'i> std::fmt::Display for EarlyEof<'i> {
             self.expected
         )
     }
+}
+
+fn skip_spaces<'i>(input: &'i Input<'i>, cursor: Cursor) -> Cursor {
+    input
+        .take_while(cursor, is_ascii_whitespace)
+        .unwrap_or(cursor)
 }
 
 #[derive(Debug, Clone)]
@@ -259,9 +269,23 @@ pub fn symbol<'i>(
 
 #[cfg(test)]
 mod test {
-    use crate::lexer::RawInput;
+    use crate::parser::RawInput;
 
     use super::*;
+
+    #[test]
+    fn test_skip_spaces() {
+        let sf = |s: &str, i: usize| {
+            let input = RawInput::new(s.to_owned());
+            let input = input.unicode_input();
+            let cursor = skip_spaces(&input, input.begin());
+            assert_eq!(cursor, Cursor::from(i));
+        };
+
+        for s in [("", 0), ("a", 0), (" ", 1), ("  b", 2), (" \n \n a", 5)] {
+            sf(s.0, s.1);
+        }
+    }
 
     fn empty_raw_input() -> RawInput {
         RawInput::new(String::new())
