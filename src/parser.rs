@@ -1,8 +1,11 @@
 #![allow(unused)]
 
-use std::{borrow::Cow, cell::Cell};
-
+use std::borrow::Cow;
 use unicode_segmentation::UnicodeSegmentation;
+
+use crate::combinators::{
+    identifier, integer, lparen, rparen, skip_spaces, symbol, ParseCharError, ParseIdentifierError,
+};
 
 #[derive(Debug, Clone, std::hash::Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RawInput {
@@ -191,8 +194,6 @@ mod test {
     }
 }
 
-use crate::combinators::{lparen, ParseCharError};
-
 #[derive(Debug, Clone, Copy, std::hash::Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SourceLocation<'i> {
     input: &'i Input<'i>,
@@ -212,27 +213,244 @@ impl ExprIndex {
     }
 }
 
-#[derive(Debug, Clone, Copy, std::hash::Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Expr<'i> {
-    Unit {
-        idx: ExprIndex,
-        loc: SourceLocation<'i>,
-    },
+#[derive(Debug, Clone)]
+pub struct ExprCtx<'i> {
+    loc: SourceLocation<'i>,
+    args: Vec<ExprIndex>,
 }
 
-fn parse<'i>(input: &'i Input<'i>) -> Result<Expr<'i>, ()> {
-    let exprs = Vec::<Expr>::with_capacity(3000);
+impl<'i> ExprCtx<'i> {
+    fn new(input: &'i Input<'i>, begin: Cursor) -> Self {
+        Self {
+            loc: SourceLocation {
+                input,
+                range: (begin, begin),
+            },
+            args: vec![],
+        }
+    }
 
-    let cursor = input.begin();
-    lparen(input, cursor).map_err(|e| ())?;
+    fn add_arg(&mut self, idx: ExprIndex) {
+        self.args.push(idx);
+    }
+}
 
-    Ok(Expr::Unit {
-        idx: ExprIndex::from(0),
-        loc: SourceLocation {
-            input,
-            range: (Cursor::from(0), Cursor::from(1)),
-        },
-    })
+#[derive(Debug, Copy, Clone)]
+pub struct PrimitiveCtx<'i, T> {
+    loc: SourceLocation<'i>,
+    v: T,
+}
+
+#[derive(Debug, Clone)]
+pub enum Expr<'i> {
+    Scope(ExprCtx<'i>),
+    Unit(ExprCtx<'i>),
+    Define(ExprCtx<'i>),
+    Lambda(ExprCtx<'i>),
+    FunctionCall(ExprCtx<'i>),
+    Integer(PrimitiveCtx<'i, i64>),
+    Symbol(PrimitiveCtx<'i, crate::combinators::Symbol>),
+}
+
+impl<'i> Expr<'i> {
+    pub(crate) fn add_arg(&mut self, idx: ExprIndex) {
+        match self {
+            Expr::Scope(c) => c.add_arg(idx),
+            Expr::Define(c) => c.add_arg(idx),
+            Expr::Lambda(c) => c.add_arg(idx),
+            Expr::FunctionCall(c) => c.add_arg(idx),
+            _ => unreachable!("only Expr types can have args"),
+        }
+    }
+
+    pub(crate) fn set_end_cursor(&mut self, end: Cursor) {
+        match self {
+            Expr::Scope(c) => c.loc.range.1 = end,
+            Expr::Unit(c) => c.loc.range.1 = end,
+            Expr::Define(c) => c.loc.range.1 = end,
+            Expr::Lambda(c) => c.loc.range.1 = end,
+            Expr::FunctionCall(c) => c.loc.range.1 = end,
+            Expr::Integer(c) => c.loc.range.1 = end,
+            Expr::Symbol(c) => c.loc.range.1 = end,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SyntaxError<'i> {
+    loc: SourceLocation<'i>,
+    description: String,
+}
+
+impl<'i> std::fmt::Display for SyntaxError<'i> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        todo!()
+    }
+}
+
+impl<'i> From<ParseCharError<'i>> for SyntaxError<'i> {
+    fn from(value: ParseCharError<'i>) -> Self {
+        SyntaxError {
+            loc: SourceLocation {
+                input: value.input,
+                range: (value.got, value.got.advance(1)),
+            },
+            description: value.to_string(),
+        }
+    }
+}
+
+impl<'i> From<ParseIdentifierError<'i>> for SyntaxError<'i> {
+    fn from(value: ParseIdentifierError<'i>) -> Self {
+        SyntaxError {
+            loc: SourceLocation {
+                input: value.input,
+                range: (value.got, value.got.advance(1)),
+            },
+            description: value.to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Ast<'i> {
+    exprs: Vec<Expr<'i>>,
+}
+
+impl<'i> Default for Ast<'i> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<'i> Ast<'i> {
+    fn new() -> Self {
+        Self {
+            exprs: Vec::with_capacity(3000),
+        }
+    }
+
+    fn get_expr_at(&self, expr_idx: ExprIndex) -> Option<&Expr<'i>> {
+        if expr_idx.get() < self.exprs.len() {
+            Some(&self.exprs[expr_idx.get()])
+        } else {
+            None
+        }
+    }
+
+    fn add_expr(&mut self, expr: Expr<'i>) -> ExprIndex {
+        self.exprs.push(expr);
+        ExprIndex::from(self.exprs.len() - 1)
+    }
+
+    fn parse_expr(
+        &mut self,
+        input: &'i Input<'i>,
+        cursor: Cursor,
+    ) -> Result<(Expr<'i>, Cursor), SyntaxError<'i>> {
+        let lparen_begin = skip_spaces(input, cursor);
+
+        let (lparen_end, _) = lparen(input, lparen_begin)?;
+
+        let id_begin = skip_spaces(input, lparen_end);
+
+        // ()
+        if let Ok((rparen_end, ())) = rparen(input, id_begin) {
+            return Ok((
+                Expr::Unit(ExprCtx {
+                    loc: SourceLocation {
+                        input,
+                        range: (lparen_begin, rparen_end),
+                    },
+                    args: vec![],
+                }),
+                rparen_end,
+            ));
+        }
+
+        // ((..
+        if lparen(input, id_begin).is_ok() {
+            let mut expr = Expr::Scope(ExprCtx::new(input, id_begin));
+            let mut c = id_begin;
+            while let Ok((arg, arg_end)) = self.parse_expr(input, c) {
+                c = arg_end;
+                expr.add_arg(self.add_expr(arg));
+                c = skip_spaces(input, c);
+            }
+            expr.set_end_cursor(c);
+            return Ok((expr, c));
+        }
+
+        // (xxx ...)
+        let (id_end, id) = identifier(input, id_begin)?;
+        let tmp_expr_ctx = ExprCtx::new(input, lparen_begin);
+        let mut expr = if id == "lambda" {
+            Expr::Lambda(tmp_expr_ctx.clone())
+        } else if id == "define" {
+            Expr::Define(tmp_expr_ctx.clone())
+        } else {
+            Expr::FunctionCall(tmp_expr_ctx.clone())
+        };
+
+        loop {
+            let mut args_begin = skip_spaces(input, id_end);
+
+            if let Ok((arg_end, v)) = integer(input, args_begin) {
+                let arg = Expr::Integer(PrimitiveCtx {
+                    loc: SourceLocation {
+                        input,
+                        range: (args_begin, arg_end),
+                    },
+                    v,
+                });
+                args_begin = arg_end;
+                expr.add_arg(self.add_expr(arg));
+            } else if let Ok((arg_end, v)) = symbol(input, args_begin) {
+                let arg = Expr::Symbol(PrimitiveCtx {
+                    loc: SourceLocation {
+                        input,
+                        range: (args_begin, arg_end),
+                    },
+                    v,
+                });
+                args_begin = arg_end;
+                expr.add_arg(self.add_expr(arg));
+            } else if let Ok((arg, arg_end)) = self.parse_expr(input, args_begin) {
+                args_begin = arg_end;
+                expr.add_arg(self.add_expr(arg));
+            } else if let Ok((arg_end, ())) = rparen(input, args_begin) {
+                expr.set_end_cursor(arg_end);
+                return Ok((expr, arg_end));
+            } else {
+                return Err(SyntaxError {
+                    loc: SourceLocation {
+                        input,
+                        range: (lparen_begin, args_begin),
+                    },
+                    description: "expected an expression/int/symbol follows this".to_owned(),
+                });
+            }
+        }
+    }
+
+    fn parse_file(&mut self, input: &'i Input<'i>) -> Result<Expr<'i>, SyntaxError<'i>> {
+        let mut file_scope_expr = Expr::Scope(ExprCtx::new(input, input.begin()));
+
+        let mut cc = input.begin();
+        loop {
+            cc = skip_spaces(input, cc);
+            if input.is_eof(cc) {
+                break;
+            }
+
+            let (expr, expr_end) = self.parse_expr(input, cc)?;
+            file_scope_expr.add_arg(self.add_expr(expr));
+            cc = expr_end;
+        }
+
+        file_scope_expr.set_end_cursor(cc);
+        Ok(file_scope_expr)
+    }
 }
 
 #[cfg(test)]
@@ -244,7 +462,21 @@ mod test_parse {
         let input = RawInput::new("()".to_owned());
         let input = input.unicode_input();
 
-        let r = parse(&input);
-        assert!(matches!(r, Ok(Expr::Unit { .. })));
+        let mut ast = Ast::new();
+        let r = ast.parse_file(&input);
+        assert!(matches!(
+            r.clone(),
+            Ok(Expr::Scope(ExprCtx { loc: SourceLocation {range: (Cursor(0), Cursor(2)), ..}, args}))
+            if args.len() == 1 && args[0] == ExprIndex::from(0)
+        ));
+        assert!(
+            matches!(
+                ast.get_expr_at(ExprIndex::from(0)),
+                Some(&Expr::Unit(ExprCtx {loc: SourceLocation {range: (Cursor(0), Cursor(2)), ..}, ref args}))
+                if args.is_empty()
+            ),
+            "{:#?}",
+                ast.get_expr_at(ExprIndex::from(0)),
+        )
     }
 }

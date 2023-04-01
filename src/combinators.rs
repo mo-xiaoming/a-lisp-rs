@@ -23,7 +23,7 @@ fn is_ascii_whitespace(c: &str) -> bool {
     c.len() == 1 && c.chars().next().unwrap().is_ascii_whitespace()
 }
 
-pub trait ParseError: std::fmt::Display {}
+pub(crate) trait ParseError {}
 
 #[derive(Debug, Clone)]
 struct EarlyEof<'i> {
@@ -44,7 +44,7 @@ impl<'i> std::fmt::Display for EarlyEof<'i> {
     }
 }
 
-fn skip_spaces<'i>(input: &'i Input<'i>, cursor: Cursor) -> Cursor {
+pub fn skip_spaces<'i>(input: &'i Input<'i>, cursor: Cursor) -> Cursor {
     input
         .take_while(cursor, is_ascii_whitespace)
         .unwrap_or(cursor)
@@ -52,9 +52,9 @@ fn skip_spaces<'i>(input: &'i Input<'i>, cursor: Cursor) -> Cursor {
 
 #[derive(Debug, Clone)]
 pub struct ParseCharError<'i> {
-    input: &'i Input<'i>,
-    expected: String,
-    got: Cursor,
+    pub(crate) input: &'i Input<'i>,
+    pub(crate) expected: String,
+    pub(crate) got: Cursor,
 }
 
 impl<'i> ParseError for ParseCharError<'i> {}
@@ -181,8 +181,23 @@ pub fn integer<'i>(
 
 #[derive(Debug, Clone, Copy)]
 pub struct ParseIdentifierError<'i> {
-    input: &'i Input<'i>,
-    got: Cursor,
+    pub(crate) input: &'i Input<'i>,
+    pub(crate) got: Cursor,
+}
+
+impl<'i> ParseError for ParseIdentifierError<'i> {}
+
+impl<'i> std::fmt::Display for ParseIdentifierError<'i> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: expected `{{identifier}}`, but got `{}`",
+            self.input.path(),
+            self.input
+                .get_str_ref(self.got, self.got.advance(1))
+                .unwrap()
+        )
+    }
 }
 
 pub fn identifier<'i>(
