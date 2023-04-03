@@ -434,9 +434,9 @@ impl<'i> Ast<'i> {
     }
 
     fn parse_file(&mut self, input: &'i Input<'i>) -> Result<Expr<'i>, SyntaxError<'i>> {
-        let mut file_scope_expr = Expr::Scope(ExprCtx::new(input, input.begin()));
+        let mut cc = skip_spaces(input, input.begin());
+        let mut file_scope_expr = Expr::Scope(ExprCtx::new(input, cc));
 
-        let mut cc = input.begin();
         loop {
             cc = skip_spaces(input, cc);
             if input.is_eof(cc) {
@@ -458,25 +458,44 @@ mod test_parse {
     use super::*;
 
     #[test]
-    fn file_level_empty_parens() {
-        let input = RawInput::new("()".to_owned());
-        let input = input.unicode_input();
+    fn almost_empty_files_is_scope_expr_with_unit_within() {
+        fn assert_scope_expr_with_unit(
+            content: &str,
+            scope_range: (Cursor, Cursor),
+            unit_range: (Cursor, Cursor),
+        ) {
+            let input = RawInput::new(content.to_owned());
+            let input = input.unicode_input();
 
-        let mut ast = Ast::new();
-        let r = ast.parse_file(&input);
-        assert!(matches!(
-            r.clone(),
-            Ok(Expr::Scope(ExprCtx { loc: SourceLocation {range: (Cursor(0), Cursor(2)), ..}, args}))
-            if args.len() == 1 && args[0] == ExprIndex::from(0)
-        ));
-        assert!(
-            matches!(
-                ast.get_expr_at(ExprIndex::from(0)),
-                Some(&Expr::Unit(ExprCtx {loc: SourceLocation {range: (Cursor(0), Cursor(2)), ..}, ref args}))
-                if args.is_empty()
+            let mut ast = Ast::new();
+            let r = ast.parse_file(&input);
+            assert!(matches!(
+                r.clone(),
+                Ok(Expr::Scope(ExprCtx { loc: SourceLocation {range: scope_range, ..}, args}))
+                if args.len() == 1 && args[0] == ExprIndex::from(0)
+            ));
+            assert!(
+                matches!(
+                    ast.get_expr_at(ExprIndex::from(0)),
+                    Some(&Expr::Unit(ExprCtx {loc: SourceLocation {range: unit_range, ..}, ref args}))
+                    if args.is_empty()
+                )
+            );
+        }
+
+        for (content, scope_range, unit_range) in [
+            (
+                "()",
+                (Cursor::from(0), Cursor::from(2)),
+                (Cursor::from(0), Cursor::from(2)),
             ),
-            "{:#?}",
-                ast.get_expr_at(ExprIndex::from(0)),
-        )
+            (
+                "  (  )  ",
+                (Cursor::from(2), Cursor::from(6)),
+                (Cursor::from(2), Cursor::from(6)),
+            ),
+        ] {
+            assert_scope_expr_with_unit(content, scope_range, unit_range);
+        }
     }
 }
