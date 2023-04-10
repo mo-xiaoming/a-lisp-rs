@@ -3,7 +3,6 @@
 #![warn(missing_debug_implementations)]
 #![forbid(overflowing_literals)]
 
-mod combinators;
 mod parser;
 
 #[doc = include_str!("../README.md")]
